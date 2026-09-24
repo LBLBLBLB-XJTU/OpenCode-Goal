@@ -1,0 +1,16 @@
+{
+  "name": "opencode-goal",
+  "version": "1.0.0",
+  "description": "Goal mode plugin for opencode: persistent session-scoped goals with event-driven auto-continuation",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node tests/unit-test.mjs",
+    "test:e2e": "node tests/e2e-test.mjs"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.31",
+    "@opencode-ai/sdk": "^1.18.31"
+  },
+  "license": "MIT"
+}
