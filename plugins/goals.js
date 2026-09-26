@@ -112,6 +112,8 @@ ${recent}
 export const GoalPlugin = async ({ client, directory, worktree }) => {
   // 进程内锁：防止同一会话并发触发多轮续跑
   const inflight = new Set()
+  // 链式驱动的延迟（等 TUI/会话完全稳定后再发下一轮）
+  const CHAIN_DELAY_MS = 3000
 
   // 安全 toast（TUI 不可用时静默失败）
   const toast = (message, variant = "info") =>
@@ -277,6 +279,89 @@ export const GoalPlugin = async ({ client, directory, worktree }) => {
   })
 
   // ------------------------------------------------------------------
+  // 续跑引擎：promise 链自驱动（主驱动）+ session.idle（兜底）
+  // ------------------------------------------------------------------
+
+  async function maybeContinue(sessionID, source) {
+    if (!sessionID || inflight.has(sessionID)) return
+    const g = await loadGoal(sessionID)
+    if (!g || g.status !== "pursuing") return
+
+    // pending 锁：续跑在途时跳过；超 TTL（崩溃/卡死）则恢复续跑
+    if (g.pending) {
+      const age = Date.now() - new Date(g.updated_at || g.created_at).getTime()
+      if (age < PENDING_TTL_MS) return
+      await log("warn", "goal pending lock expired, resuming", { sessionID, ageMs: age })
+    }
+
+    // 迭代预算
+    if (g.iteration >= g.max_iterations) {
+      g.status = "budget_limited"
+      await saveGoal(sessionID, g)
+      await toast(`⏹ Goal 已达迭代上限 ${g.max_iterations}，自动续跑停止`, "warning")
+      return
+    }
+
+    g.iteration += 1
+    g.pending = true
+    await saveGoal(sessionID, g)
+    inflight.add(sessionID)
+    await log("info", "goal continue", {
+      sessionID,
+      source,
+      iteration: g.iteration,
+      objective: g.objective,
+    })
+
+    client.session
+      .prompt({
+        path: { id: sessionID },
+        body: { parts: [{ type: "text", text: nextRoundPrompt(g) }] },
+      })
+      .then(async () => {
+        const cur = await loadGoal(sessionID)
+        if (cur) {
+          cur.pending = false
+          cur.fail_count = 0
+          await saveGoal(sessionID, cur)
+        }
+        inflight.delete(sessionID)
+        scheduleChain(sessionID)
+      })
+      .catch(async (err) => {
+        const msg = String(err?.message || err)
+        const cur = await loadGoal(sessionID)
+        inflight.delete(sessionID)
+        if (!cur) return
+        cur.pending = false
+        if (/abort|cancel|interrupt/i.test(msg)) {
+          cur.status = "paused"
+          await saveGoal(sessionID, cur)
+          await toast(`⏸ 检测到手动中断，Goal 已自动暂停（/goal-resume 恢复）`, "info")
+        } else {
+          cur.fail_count = (cur.fail_count || 0) + 1
+          if (cur.fail_count >= MAX_FAILS) {
+            cur.status = "blocked"
+            cur.blocker = `连续 ${cur.fail_count} 次续跑失败: ${msg.slice(0, 300)}`
+            await toast(`⛔ Goal 续跑连续失败，已阻塞`, "error")
+          }
+          await saveGoal(sessionID, cur)
+        }
+      })
+  }
+
+  // 链式驱动：上一轮彻底结束后，延迟安排下一轮（不依赖外部事件，
+  // 修复 idle 事件与 promise 回调的竞态导致循环静默停止的问题）
+  function scheduleChain(sessionID) {
+    setTimeout(async () => {
+      const g = await loadGoal(sessionID)
+      if (g && g.status === "pursuing") {
+        await maybeContinue(sessionID, "chain")
+      }
+    }, CHAIN_DELAY_MS)
+  }
+
+  // ------------------------------------------------------------------
   // 生命周期 / 上下文钩子
   // ------------------------------------------------------------------
 
@@ -293,78 +378,14 @@ export const GoalPlugin = async ({ client, directory, worktree }) => {
     },
 
     /**
-     * 事件驱动续跑：会话空闲时检查是否有活跃 Goal。
-     * 防重：inflight 内存锁 + pending 持久标记（TTL 兜底进程崩溃）。
+     * 事件驱动续跑（兜底）：会话空闲时检查是否有活跃 Goal。
+     * 主驱动是 maybeContinue 的 promise 链（见 scheduleChain），
+     * 此事件仅用于进程重启/TUI 重新激活后的恢复触发。
      */
     event: async ({ event }) => {
       if (!event || event.type !== "session.idle") return
       const sessionID = event.properties?.sessionID
-      if (!sessionID || inflight.has(sessionID)) return
-
-      const g = await loadGoal(sessionID)
-      if (!g || g.status !== "pursuing") return
-
-      // pending 锁：续跑在途时跳过；超 TTL（崩溃/卡死）则恢复续跑
-      if (g.pending) {
-        const age = Date.now() - new Date(g.updated_at || g.created_at).getTime()
-        if (age < PENDING_TTL_MS) return
-        await log("warn", "goal pending lock expired, resuming", { sessionID, ageMs: age })
-      }
-
-      // 迭代预算
-      if (g.iteration >= g.max_iterations) {
-        g.status = "budget_limited"
-        await saveGoal(sessionID, g)
-        await toast(`⏹ Goal 已达迭代上限 ${g.max_iterations}，自动续跑停止`, "warning")
-        return
-      }
-
-      g.iteration += 1
-      g.pending = true
-      await saveGoal(sessionID, g)
-      inflight.add(sessionID)
-      await log("info", "goal continue", {
-        sessionID,
-        iteration: g.iteration,
-        objective: g.objective,
-      })
-
-      client.session
-        .prompt({
-          path: { id: sessionID },
-          body: { parts: [{ type: "text", text: nextRoundPrompt(g) }] },
-        })
-        .then(async () => {
-          const cur = await loadGoal(sessionID)
-          if (cur) {
-            cur.pending = false
-            cur.fail_count = 0
-            await saveGoal(sessionID, cur)
-          }
-        })
-        .catch(async (err) => {
-          const msg = String(err?.message || err)
-          const cur = await loadGoal(sessionID)
-          if (!cur) return
-          cur.pending = false
-          if (/abort|cancel/i.test(msg)) {
-            // 用户主动中断视为叫停：自动暂停而不是继续轰炸
-            cur.status = "paused"
-            await saveGoal(sessionID, cur)
-            await toast(`⏸ 检测到手动中断，Goal 已自动暂停（/goal-resume 恢复）`, "info")
-          } else {
-            cur.fail_count = (cur.fail_count || 0) + 1
-            if (cur.fail_count >= MAX_FAILS) {
-              cur.status = "blocked"
-              cur.blocker = `连续 ${cur.fail_count} 次续跑失败: ${msg.slice(0, 300)}`
-              await toast(`⛔ Goal 续跑连续失败，已阻塞`, "error")
-            }
-            await saveGoal(sessionID, cur)
-          }
-        })
-        .finally(() => {
-          inflight.delete(sessionID)
-        })
+      await maybeContinue(sessionID, "idle")
     },
 
     /**
