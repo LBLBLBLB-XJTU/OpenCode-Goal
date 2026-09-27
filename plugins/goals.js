@@ -284,8 +284,11 @@ export const GoalPlugin = async ({ client, directory, worktree }) => {
 
   async function maybeContinue(sessionID, source) {
     if (!sessionID || inflight.has(sessionID)) return
-    const g = await loadGoal(sessionID)
-    if (!g || g.status !== "pursuing") return
+    inflight.add(sessionID) // 同步加锁：消除 await 期间的并发窗口（曾导致重复续跑）
+    let handoff = false
+    try {
+      const g = await loadGoal(sessionID)
+      if (!g || g.status !== "pursuing") return
 
     // pending 锁：续跑在途时跳过；超 TTL（崩溃/卡死）则恢复续跑
     if (g.pending) {
@@ -305,7 +308,7 @@ export const GoalPlugin = async ({ client, directory, worktree }) => {
     g.iteration += 1
     g.pending = true
     await saveGoal(sessionID, g)
-    inflight.add(sessionID)
+    handoff = true // 锁移交 promise 回调释放
     await log("info", "goal continue", {
       sessionID,
       source,
@@ -348,6 +351,9 @@ export const GoalPlugin = async ({ client, directory, worktree }) => {
           await saveGoal(sessionID, cur)
         }
       })
+    } finally {
+      if (!handoff) inflight.delete(sessionID)
+    }
   }
 
   // 链式驱动：上一轮彻底结束后，延迟安排下一轮（不依赖外部事件，
