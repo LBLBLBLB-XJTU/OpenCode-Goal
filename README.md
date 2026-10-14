@@ -2,6 +2,10 @@
 
 给 [opencode](https://opencode.ai) 的 **Goal 模式**插件 —— 会话级持久目标 + 事件驱动自动续跑 + 证据驱动完成。
 
+> 适配 **OpenCode ≥ 2.0**（V2 插件 API）。旧版 V1 插件在 V2 下会报
+> `Plugin must export a default definition with an id and an effect or setup function`，
+> 用本版覆盖安装即可（见[从 V1 升级](#从-v1-升级)）。
+
 > 复刻 OpenAI Codex `/goal` 的核心语义：给一个目标，agent 每轮回复结束后自动继续推进，直到**客观达成**、**诚实阻塞**、暂停或达到迭代上限。
 
 ```
@@ -17,7 +21,7 @@
 | 能力 | 说明 |
 |------|------|
 | 🎯 持久目标 | 目标/完成条件/验证方式/约束 绑定到会话，跨轮次存活 |
-| 🔁 自动续跑 | `session.idle` 事件驱动：每轮回复结束即注入下一轮，不需要反复说"继续" |
+| 🔁 自动续跑 | 真实执行事件驱动：一轮结束（`session.execution.succeeded`）即注入下一轮，`session.idle` 兜底恢复，不需要反复说"继续" |
 | ✅ 证据驱动完成 | 标记完成必须附**具体证据**（命令输出/文件/数值），短证据直接拒绝 |
 | ⛔ 诚实阻塞 | 无法继续时调用 `goal_block` 说明原因与所需输入，而不是假装完成 |
 | 👁 目标持续可见 | 每轮 system prompt 注入当前目标；上下文压缩时自动保留 |
@@ -54,7 +58,7 @@ for f in goal goal-status goal-pause goal-resume goal-clear; do \
 
 > **重启 opencode 后生效**。全局安装意味着所有项目都可以用。
 
-依赖：无额外依赖（使用 opencode 自带的 `@opencode-ai/plugin`）。
+依赖：零安装依赖 —— 运行时由 opencode 宿主解析 `@opencode/plugin`，无需 `npm install`（仅跑单元测试时需要，见下文）。
 
 ## 快速开始
 
@@ -110,12 +114,14 @@ for f in goal goal-status goal-pause goal-resume goal-clear; do \
 
 ## 工作原理
 
-1. **事件驱动**：监听 `session.idle`。会话空闲且存在 `pursuing` 目标时，通过 SDK 注入下一轮
-   （`session.prompt`），而不是简单死循环 —— 不会打断你正在输入的内容。
+1. **事件驱动**：续跑 prompt 提交后，由真实执行事件收尾 —— `session.execution.succeeded`
+   清锁并延迟 3 秒安排下一轮；`session.idle` 作为兜底（进程重启 / TUI 重新激活后恢复）。
+   事件先落盘再发消息，不会打断你正在输入的内容。
 2. **防重**：进程内锁 + 状态文件 `pending` 标记双保险；pending 超过 3 小时视为崩溃残留并自动恢复。
-3. **目标始终在场**：`experimental.chat.system.transform` 每轮注入目标；
-   `experimental.session.compacting` 保证长会话压缩后目标与进度不丢失。
-4. **终止条件完备**：达成 / 阻塞 / 暂停 / 清除 / 迭代上限 / 连续失败，任意一个都会停止续跑。
+3. **目标始终在场**：`ctx.session.hook("context")` 每轮注入目标；
+   `ctx.session.hook("compaction")` 在压缩时注入保留块，且每轮都从磁盘重读目标，压缩不丢状态。
+4. **终止条件完备**：达成 / 阻塞 / 暂停 / 清除 / 迭代上限 / 连续失败 / 用户中断
+   （esc → 自动暂停），任意一个都会停止续跑。
 
 ## 状态存储
 
@@ -147,32 +153,53 @@ for f in goal goal-status goal-pause goal-resume goal-clear; do \
 ## 文件结构
 
 ```
-plugins/goals.js        # 插件主体（单文件，零依赖）
+plugins/goals.js        # 插件主体（单文件，运行时零依赖）
 command/goal.md         # /goal <目标>
 command/goal-status.md  # /goal-status
 command/goal-pause.md   # /goal-pause
 command/goal-resume.md  # /goal-resume
 command/goal-clear.md   # /goal-clear
+tests/unit-test.mjs     # 单元测试（mock 插件上下文）
+tests/e2e-test.mjs      # 端到端测试（真实服务 + 真实模型）
 ```
+
+## 从 V1 升级
+
+OpenCode 2.x 不再加载 V1 插件（报错 `Plugin must export a default definition with an id and an effect or setup function`）。
+覆盖 `plugins/goals.js` 后重启即可，**目标状态文件格式与路径不变，已有 goal 无需迁移**。主要变化：
+
+| | V1 | V2（本版） |
+|---|---|---|
+| 入口 | 具名导出 `GoalPlugin` | `export default Plugin.define({ id, setup })` |
+| 续跑驱动 | prompt promise 链 | `session.execution.succeeded/failed/interrupted` 事件 + `session.idle` 兜底 |
+| system 注入 | `experimental.chat.system.transform` | `ctx.session.hook("context")` |
+| 压缩保留 | `experimental.session.compacting` | `ctx.session.hook("compaction")` |
+| 进度提示 | TUI toast | 工具返回文本 + 服务端日志（V2 服务端插件无 toast API） |
+| 工具名 / 命令 | 8 个工具、5 个命令 | 不变，配置无需改动 |
 
 ## 测试
 
-**单元测试**（18 项，mock client，不触碰真实会话）：
+**单元测试**（46 项，mock 插件上下文，不触碰真实会话/模型，约 1 分钟）：
 
 ```bash
+npm install        # 首次（仅为测试安装 @opencode/plugin）
 node tests/unit-test.mjs
 ```
 
-覆盖：工具集完整性、重复创建拒绝、idle 触发续跑、续跑消息内容、进度记录、短证据拦截、完成后停止、暂停恢复、迭代上限、清理等。
+覆盖：V2 定义与工具注册、system/compaction 注入、idle 触发续跑、事件链式续跑、双触发防重、
+迭代上限、暂停/恢复、短证据拦截、完成后停止、阻塞后停止、连续失败转 blocked、
+用户中断自动暂停、superseded 中断、prompt 提交失败释放锁、cleanup 中止订阅。
 
-**端到端测试**（真实 server + 真实模型，验证完整生命周期）：
+**端到端测试**（真实服务 + 真实模型，零 SDK 依赖，约 4 分钟）：
 
 ```bash
-opencode serve --port 4097   # 另开终端
 node tests/e2e-test.mjs
+# 或指定独立实例：
+OPENCODE_URL=http://127.0.0.1:4097 node tests/e2e-test.mjs
 ```
 
-验证链路：目标创建 → **自动续跑** → 诚实阻塞（缺输入时不编造）→ 恢复 → 完成（附证据）→ 停止续跑。
+验证链路：目标创建 → **事件链自动续跑** → 诚实阻塞（缺输入时不编造）→ 恢复 → 完成（附证据）→
+停止续跑。默认自动发现后台服务（Basic auth 自动读取 `service.json`），测试结束自动删除测试会话。
 
 ## License
 
