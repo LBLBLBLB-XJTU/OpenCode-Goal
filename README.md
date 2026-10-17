@@ -21,12 +21,12 @@
 | 能力 | 说明 |
 |------|------|
 | 🎯 持久目标 | 目标/完成条件/验证方式/约束 绑定到会话，跨轮次存活 |
-| 🔁 自动续跑 | 真实执行事件驱动：一轮结束（`session.execution.succeeded`）即注入下一轮，`session.idle` 兜底恢复，不需要反复说"继续" |
+| 🔁 自动续跑 | 真实执行事件驱动：一轮结束（`session.execution.succeeded`）即注入下一轮；检测到仍在运行的后台任务时暂缓，任务结束 +15s 复检后继续；`session.idle` 兜底恢复 |
 | ✅ 证据驱动完成 | 标记完成必须附**具体证据**（命令输出/文件/数值），短证据直接拒绝 |
 | ⛔ 诚实阻塞 | 无法继续时调用 `goal_block` 说明原因与所需输入，而不是假装完成 |
 | 👁 目标持续可见 | 每轮 system prompt 注入当前目标；上下文压缩时自动保留 |
 | 💰 迭代预算 | 默认最多 30 轮自动续跑，超限自动停止并通知 |
-| 🛡 防失控 | 并发锁 + pending 标记（崩溃自动恢复）、连续 3 次续跑失败自动阻塞、**手动中断 → 自动暂停** |
+| 🛡 防失控 | 跨实例注入互斥锁（`<sessionID>.inject.lock`）+ 后台任务闸门（TTL 安全阀）、pending 标记（崩溃自动恢复）、连续 3 次续跑失败自动阻塞、**手动中断 → 自动暂停** |
 | 📝 进度留痕 | 每轮强制 `goal_update_progress`，续跑时携带最近 5 条进度 |
 
 ## 安装
@@ -117,7 +117,7 @@ for f in goal goal-status goal-pause goal-resume goal-clear; do \
 1. **事件驱动**：续跑 prompt 提交后，由真实执行事件收尾 —— `session.execution.succeeded`
    清锁并延迟 3 秒安排下一轮；`session.idle` 作为兜底（进程重启 / TUI 重新激活后恢复）。
    事件先落盘再发消息，不会打断你正在输入的内容。
-2. **防重**：进程内锁 + 状态文件 `pending` 标记双保险；pending 超过 3 小时视为崩溃残留并自动恢复。
+2. **任务闸门与防重**：跟踪运行中的 shell（`shell.created/updated/exited/deleted`），任务未结束前不注入下一轮（结束 +15s 复检，12h 安全阀）；跨实例互斥锁 `<sessionID>.inject.lock`（5s 陈旧接管）保证多实例只注入一次；进程内锁 + `pending` 标记双保险；pending 超过 3 小时视为崩溃残留并自动恢复。
 3. **目标始终在场**：`ctx.session.hook("context")` 每轮注入目标；
    `ctx.session.hook("compaction")` 在压缩时注入保留块，且每轮都从磁盘重读目标，压缩不丢状态。
 4. **终止条件完备**：达成 / 阻塞 / 暂停 / 清除 / 迭代上限 / 连续失败 / 用户中断
@@ -177,18 +177,31 @@ OpenCode 2.x 不再加载 V1 插件（报错 `Plugin must export a default defin
 | 进度提示 | TUI toast | 工具返回文本 + 服务端日志（V2 服务端插件无 toast API） |
 | 工具名 / 命令 | 8 个工具、5 个命令 | 不变，配置无需改动 |
 
+## 更新日志
+
+### v2.2.0 — 2026-10-17 ｜「运行中不停轮」修复
+
+- **修复：后台任务仍在运行时提前注入下一轮**（旧行为：回合结束后约 3 秒即注入，长任务未完成就开启新轮）
+- **修复：多实例重复注入**（opencode 热加载 / 多工作区并存时，同一回合被两个插件实例各注入一次）
+- 续跑闸门改由真实运行时事件驱动：跟踪 `shell.created / shell.updated / shell.exited / shell.deleted`（会话关联取 `info.metadata.sessionID`）；仍有未结束的 shell 时不注入，shell 结束后延迟 15s 复检再继续
+- 跨实例互斥锁：`<GOAL_DIR>/<sessionID>.inject.lock`（O_EXCL 创建 + 5s 陈旧接管 + token 释放；prompt 受理失败也会释放）
+- 安全阀：shell 记录存活超过 12h 视为结束事件丢失，告警后放行；轮次提示词明确要求"等任务真正结束、核对结果后再收尾"
+- 单元测试重写为 25 项（main 22 + ttl 3），覆盖运行中暂缓、事件链、互斥锁、陈旧接管、TTL 等新语义
+
+> 升级方式：覆盖 `plugins/goals.js` 即可（无状态迁移）。调试环境变量见文件头部注释（`GOAL_CHAIN_DELAY_MS` / `GOAL_SHELL_RECHECK_MS` / `GOAL_SHELL_TTL_MS` / `GOAL_DIR_OVERRIDE` 等）。
+
 ## 测试
 
-**单元测试**（46 项，mock 插件上下文，不触碰真实会话/模型，约 1 分钟）：
+**单元测试**（25 项 = main 22 + ttl 3，mock 插件上下文 + 真实事件形状，不触碰真实会话/模型，秒级完成）：
 
 ```bash
 npm install        # 首次（仅为测试安装 @opencode/plugin）
-node tests/unit-test.mjs
+node tests/unit-test.mjs        # 自动依次运行 main + ttl 两个套件
 ```
 
-覆盖：V2 定义与工具注册、system/compaction 注入、idle 触发续跑、事件链式续跑、双触发防重、
-迭代上限、暂停/恢复、短证据拦截、完成后停止、阻塞后停止、连续失败转 blocked、
-用户中断自动暂停、superseded 中断、prompt 提交失败释放锁、cleanup 中止订阅。
+覆盖：事件链续跑、**后台任务运行中暂缓（核心回归）**、`shell.updated` 不重置、短命前台 shell、
+`exited`/`deleted` 释放闸门、跨实例互斥锁（外部持有 / 释放恢复 / 陈旧接管）、双触发去重、
+暂停恢复、预算上限、TTL 安全阀、context/compaction 钩子注入、完成/阻塞/受理失败路径、cleanup 中止订阅。
 
 **端到端测试**（真实服务 + 真实模型，零 SDK 依赖，约 4 分钟）：
 

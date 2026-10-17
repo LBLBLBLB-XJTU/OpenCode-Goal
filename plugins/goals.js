@@ -31,21 +31,46 @@
  *       故即使摘要丢失，目标仍会随每轮请求恢复可见）
  *   - 清理：返回值 `dispose/event` → `setup` 返回的 cleanup + 自动回收的注册
  *   - V2 服务端插件没有 TUI toast / app.log 接口，提示改为工具返回文本 + console 日志
+ *
+ * ---------------------------------------------------------------------------
+ * V2.2（2026-10-17）：「运行中不停轮」修复（按运行时实测事件校准）——任务未结束前不再注入下一轮：
+ *   1. shell 跟踪使用真实运行时事件（2026-10-17 实测）：
+ *      `shell.created` / `shell.updated` → data.info = { id, command, metadata.sessionID, ... }
+ *      `shell.exited` / `shell.deleted`  → data = { id, ... }；顶层没有 sessionID，
+ *      会话关联取 info.metadata.sessionID（metadata 无 background 标志，所有 shell 均跟踪）。
+ *   2. 仍有运行中的 shell 时续跑暂缓（log: goal continue deferred），
+ *      shell 结束事件到达后延迟复检续跑（SHELL_RECHECK_DELAY_MS）；
+ *      回合结束的链式检查以「仍在运行者」为准（前台工具调用在回合结束前已退出，不受影响）。
+ *   3. 跨实例互斥锁（<GOAL_DIR>/<sessionID>.inject.lock，open "wx" + 5s 陈旧接管 + token 释放）：
+ *      热加载/多工作区并存的实例间只允许一个注入，防止重复续跑消息。
+ *   4. 轮次提示明确要求：等长任务真正结束、核对结果后再结束本轮；
+ *      禁止以「仍在运行/继续观察」为由空转结束本轮。
+ *   5. 安全阀：shell 记录超过 SHELL_DEFER_TTL_MS 视为完成事件丢失，告警后放行；
+ *      pending 锁在运行中的回合内仍然生效（防止复检在回合中途注入）。
+ *   调试用环境变量（可选）：GOAL_CHAIN_DELAY_MS / GOAL_SHELL_RECHECK_MS /
+ *   GOAL_SHELL_TTL_MS / GOAL_PENDING_TTL_MS / GOAL_DIR_OVERRIDE。
  */
 import { Plugin } from "@opencode/plugin"
 import { promises as fsp } from "node:fs"
+import fs from "node:fs"
 import path from "node:path"
 import os from "node:os"
 
-const GOAL_DIR = path.join(os.homedir(), ".config", "opencode", "goals")
+const GOAL_DIR =
+  process.env.GOAL_DIR_OVERRIDE || path.join(os.homedir(), ".config", "opencode", "goals")
 const DEFAULT_MAX_ITER = 30
 const MAX_FAILS = 3
 // pending 锁的过期时间：续跑已发起但长时间未结束（如进程崩溃）时允许恢复
-const PENDING_TTL_MS = 3 * 60 * 60 * 1000
+const PENDING_TTL_MS = Number(process.env.GOAL_PENDING_TTL_MS || 3 * 60 * 60 * 1000)
 // 一轮结束后延迟多久再安排下一轮（等 TUI/会话完全稳定）
-const CHAIN_DELAY_MS = 3000
+const CHAIN_DELAY_MS = Number(process.env.GOAL_CHAIN_DELAY_MS || 3000)
 // 事件流中断后的重连间隔
 const RECONNECT_DELAY_MS = 5000
+// 后台任务闸门：shell 结束事件到达后，延迟复检是否可续跑
+// （先让「任务完成通知」回合被受理，避免与其竞争注入）
+const SHELL_RECHECK_DELAY_MS = Number(process.env.GOAL_SHELL_RECHECK_MS || 15000)
+// 后台任务闸门安全阀：shell 记录存活超过该时长视为完成事件丢失，告警后放行
+const SHELL_DEFER_TTL_MS = Number(process.env.GOAL_SHELL_TTL_MS || 12 * 60 * 60 * 1000)
 
 // ---------------------------------------------------------------------------
 // 状态存取（每个会话一个 JSON 文件）
@@ -78,6 +103,125 @@ async function removeGoalFile(sessionID) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 后台任务跟踪：会话仍有未结束的后台命令时，续跑暂缓（等命令真正结束后再继续）
+// 运行时真实事件（2026-10-17 实测）：
+//   shell.created / shell.updated → data.info = { id, status, command, cwd, shell, file,
+//                                                  metadata: { sessionID, ... } }
+//   shell.exited                  → data = { id, exit, status }
+//   shell.deleted                 → data = { id }
+// 注意：shell 事件顶层没有 sessionID，会话关联在 info.metadata.sessionID。
+// ---------------------------------------------------------------------------
+
+// shellID -> { sessionID, command, isBackground, startedAt }
+const liveShells = new Map()
+
+function noteShellInfo(info, isCreate) {
+  if (!info || !info.id) return
+  const sessionID = info.metadata?.sessionID
+  if (!sessionID) return // 无法关联会话的 shell 不参与闸门
+  const key = String(info.id)
+  if (!isCreate && liveShells.has(key)) return // updated：不重置计时
+  liveShells.set(key, {
+    sessionID: String(sessionID),
+    command: String(info.command || ""),
+    isBackground: info.metadata?.background === true,
+    startedAt: Date.now(),
+  })
+}
+
+function dropShell(shellID) {
+  if (!shellID) return undefined
+  const key = String(shellID)
+  const known = liveShells.get(key)
+  liveShells.delete(key)
+  return known
+}
+
+// 返回仍在运行的命令（超过安全阀的条目视为完成事件丢失，告警并清理）
+function activeShells(sessionID) {
+  const now = Date.now()
+  const alive = []
+  for (const [id, info] of liveShells) {
+    if (info.sessionID !== sessionID) continue
+    const age = now - info.startedAt
+    if (age >= SHELL_DEFER_TTL_MS) {
+      log("warn", "stale running shell ignored (completion event likely lost)", {
+        sessionID,
+        shell: id,
+        command: info.command.slice(0, 120),
+        ageMs: age,
+      })
+      liveShells.delete(id)
+      continue
+    }
+    alive.push({ id, ...info })
+  }
+  return alive
+}
+
+// ---------------------------------------------------------------------------
+// 跨实例注入互斥锁：热加载会并存多份插件实例（实测每次重载产生 2 份），
+// 用文件锁保证同一触发只被一个实例注入一次。
+// ---------------------------------------------------------------------------
+
+const injectLocks = new Map() // sessionID -> 本实例持有的锁 token
+const INJECT_MUTEX_STALE_MS = 5000
+
+function injectLockPath(sessionID) {
+  return path.join(GOAL_DIR, `${sessionID}.inject.lock`)
+}
+
+function acquireInjectMutex(sessionID) {
+  if (!sessionID) return false
+  const p = injectLockPath(sessionID)
+  const token = `${process.pid}:${GOALS_INST}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`
+  const tryCreate = () => {
+    try {
+      const h = fs.openSync(p, "wx")
+      fs.writeSync(h, token)
+      fs.closeSync(h)
+      return true
+    } catch (err) {
+      if (err && err.code === "EEXIST") return null
+      return false
+    }
+  }
+  let r = tryCreate()
+  if (r === true) {
+    injectLocks.set(sessionID, token)
+    return true
+  }
+  if (r === null) {
+    try {
+      const st = fs.statSync(p)
+      if (Date.now() - st.mtimeMs > INJECT_MUTEX_STALE_MS) {
+        fs.unlinkSync(p) // 陈旧锁（持有者异常退出）：接管
+        r = tryCreate()
+        if (r === true) {
+          injectLocks.set(sessionID, token)
+          return true
+        }
+      }
+    } catch {
+      /* 其他实例已接管 */
+    }
+  }
+  return false
+}
+
+function releaseInjectMutex(sessionID) {
+  const token = injectLocks.get(sessionID)
+  if (!token) return
+  injectLocks.delete(sessionID)
+  try {
+    const cur = fs.readFileSync(injectLockPath(sessionID), "utf8")
+    if (cur === token) fs.unlinkSync(injectLockPath(sessionID))
+  } catch {
+    /* ignore */
+  }
+}
+
 function log(level, message, extra) {
   const line = `[goal-plugin] ${message}`
   const detail = extra === undefined ? "" : extra
@@ -89,6 +233,9 @@ function log(level, message, extra) {
 function errMsg(err) {
   return String(err?.message || err)
 }
+
+// 实例标识：跨实例注入互斥锁的持有者 token（现场诊断日志已于验证通过后移除）
+const GOALS_INST = Math.random().toString(36).slice(2, 8)
 
 function fmtStatus(g) {
   const statusLabel = {
@@ -135,7 +282,8 @@ ${recent}
 1. 【先验证】检查完成条件当前是否已经满足（运行验证命令 / 检查产物文件 / 对照证据）。已满足 → 调用 goal_complete 并附上具体证据（命令输出、文件路径、数值），结束工作。
 2. 【诚实阻塞】若确认无法继续推进（缺资源、缺用户关键输入、连续失败且无新路径）→ 调用 goal_block 说明原因与所需输入。
 3. 【推进】否则从当前状态继续：优先做最有价值且未被证伪的下一步；不要重复此前已证明无效的尝试。
-4. 【留痕】结束本轮前调用 goal_update_progress，记录：本轮做了什么、结果如何、下一步计划。`
+4. 【等任务完成再结束本轮】如果本轮启动或依赖长任务（后台命令、训练、远程作业）：不得在任务仍在运行时以「仍在运行/稍后继续/继续观察」为由空转结束本轮。必须等任务真正结束并核对结果后再结束本轮——可用阻塞式等待命令原地等待，或让后台任务继续运行（系统检测到未结束的后台任务会自动暂缓续跑，任务结束后继续）。
+5. 【留痕】结束本轮前调用 goal_update_progress，记录：本轮做了什么、结果如何、下一步计划。`
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +307,8 @@ export default Plugin.define({
         description:
           "创建会话级持久目标（Goal 模式）。适用于有明确完成条件、需要多轮迭代推进的长周期任务" +
           "（如性能优化、调试、迁移、研究、批量实验）。设定后：每当回答结束进入空闲，系统会自动" +
-          "续跑下一轮，直到达成完成条件（goal_complete）、被阻塞（goal_block）、暂停或达到迭代上限。",
+          "续跑下一轮；若检测到会话仍有未结束的后台任务，会等任务结束后再续跑。直到达成完成条件" +
+          "（goal_complete）、被阻塞（goal_block）、暂停或达到迭代上限。",
         input: {
           type: "object",
           properties: {
@@ -374,9 +523,13 @@ export default Plugin.define({
       try {
         const g = await loadGoal(event.sessionID)
         if (!g) return
+        const shells = g.status === "pursuing" ? activeShells(event.sessionID) : []
         const tail =
           g.status === "pursuing"
-            ? `自动续跑进行中（第 ${g.iteration}/${g.max_iterations} 轮）。每轮结束前：达成调用 goal_complete（附证据）；无法继续调用 goal_block；否则用 goal_update_progress 留痕。`
+            ? `自动续跑进行中（第 ${g.iteration}/${g.max_iterations} 轮）。每轮结束前：达成调用 goal_complete（附证据）；无法继续调用 goal_block；否则用 goal_update_progress 留痕。` +
+              (shells.length
+                ? `检测到 ${shells.length} 个未结束的后台任务，续跑暂缓至其结束；请先等任务完成并核对结果再结束本轮。`
+                : "")
             : `当前状态：${g.status}。`
         event.system.push({
           type: "text",
@@ -428,6 +581,11 @@ export default Plugin.define({
     async function maybeContinue(sessionID, source) {
       if (!sessionID || inflight.has(sessionID)) return
       inflight.add(sessionID) // 同步加锁：消除 await 期间的并发窗口（曾导致重复续跑）
+      // 跨实例互斥：热加载并存的另一份实例正在处理同一触发时，直接让出
+      if (!acquireInjectMutex(sessionID)) {
+        inflight.delete(sessionID)
+        return
+      }
       try {
         const g = await loadGoal(sessionID)
         if (!g || g.status !== "pursuing") return
@@ -435,8 +593,20 @@ export default Plugin.define({
         // pending 锁：续跑在途时跳过；超 TTL（崩溃/卡死）则恢复续跑
         if (g.pending) {
           const age = Date.now() - new Date(g.updated_at || g.created_at).getTime()
-          if (age < PENDING_TTL_MS) return
+          if (age < PENDING_TTL_MS) {
+            return
+          }
           log("warn", "goal pending lock expired, resuming", { sessionID, ageMs: age })
+        }
+
+        // 后台任务闸门：仍有未结束的后台命令时暂缓续跑（命令结束事件会再触发复检）
+        const shells = activeShells(sessionID)
+        if (shells.length) {
+          log("info", "goal continue deferred: background commands still running", {
+            sessionID,
+            shells: shells.map((s) => `${s.id}:${s.command.slice(0, 80)}`),
+          })
+          return
         }
 
         // 迭代预算
@@ -478,6 +648,7 @@ export default Plugin.define({
       } catch (err) {
         log("error", "maybeContinue failed", { sessionID, source, error: errMsg(err) })
       } finally {
+        releaseInjectMutex(sessionID)
         inflight.delete(sessionID)
       }
     }
@@ -489,6 +660,19 @@ export default Plugin.define({
           log("error", "chain continue failed", { sessionID, error: errMsg(err) }),
         )
       }, CHAIN_DELAY_MS)
+    }
+
+    // 后台任务结束后的复检（同一会话只保留一个待触发复检，避免堆积）
+    const shellRechecks = new Map()
+    function scheduleShellRecheck(sessionID) {
+      if (!sessionID || shellRechecks.has(sessionID)) return
+      const timer = setTimeout(() => {
+        shellRechecks.delete(sessionID)
+        maybeContinue(sessionID, "shell-ended").catch((err) =>
+          log("error", "shell recheck continue failed", { sessionID, error: errMsg(err) }),
+        )
+      }, SHELL_RECHECK_DELAY_MS)
+      shellRechecks.set(sessionID, timer)
     }
 
     // 一轮成功结束：释放 pending 锁并安排下一轮
@@ -545,6 +729,17 @@ export default Plugin.define({
     async function dispatchEvent(event) {
       if (!event || typeof event.type !== "string") return
       const sessionID = event.data?.sessionID ?? event.properties?.sessionID
+      // shell 事件（实测运行时名称）：顶层无 sessionID，会话关联在 info.metadata.sessionID
+      if (event.type === "shell.created" || event.type === "shell.updated") {
+        noteShellInfo(event.data?.info ?? event.properties?.info, event.type === "shell.created")
+        return undefined
+      }
+      if (event.type === "shell.exited" || event.type === "shell.deleted") {
+        const known = dropShell(event.data?.id ?? event.properties?.id)
+        // 后台任务结束：延迟复检（完成通知回合与其并发到达，pending/互斥锁防重）
+        if (known?.sessionID) scheduleShellRecheck(known.sessionID)
+        return undefined
+      }
       if (!sessionID) return
       switch (event.type) {
         case "session.execution.succeeded":
@@ -582,7 +777,11 @@ export default Plugin.define({
 
     log("info", `plugin loaded (OpenCode ${ctx.app.version})`, { directory: ctx.location.directory })
 
-    // cleanup：中止事件订阅（其余 hook/transform 注册随插件卸载自动回收）
-    return () => controller.abort()
+    // cleanup：中止事件订阅 + 清理复检定时器（其余 hook/transform 注册随插件卸载自动回收）
+    return () => {
+      controller.abort()
+      for (const timer of shellRechecks.values()) clearTimeout(timer)
+      shellRechecks.clear()
+    }
   },
 })

@@ -1,6 +1,6 @@
 {
   "name": "opencode-goal",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "description": "Goal mode plugin for OpenCode V2: persistent session-scoped goals with event-driven auto-continuation",
   "type": "module",
   "private": true,

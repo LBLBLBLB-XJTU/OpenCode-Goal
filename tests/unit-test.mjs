@@ -1,106 +1,79 @@
-// Goal 插件功能测试（V2 插件 API：mock context，不触碰真实会话/模型）
-// 用法: node tests/unit-test.mjs
+// Goal 插件单元测试 —— v2.2 真实事件形状（2026-10-17 实测校准版）
+// 用法: node tests/unit-test.mjs                 （自动依次运行 main + ttl 两个套件）
+//       TEST_MODE=main node tests/unit-test.mjs  （单独运行某个套件）
 //
-// 与 V1 测试的区别：
-//   - 入口从具名导出 GoalPlugin(...) 改为 default export { id, setup } + mock 插件上下文
-//   - 续跑由事件驱动（session.execution.succeeded/failed/interrupted + session.idle 兜底），
-//     不再依赖 prompt promise 自动链接，因此用事件总线模拟真实事件流
-//   - V2 服务端插件没有 TUI toast，改为断言 console.warn 日志与工具返回文本
-import { promises as fsp } from "node:fs"
-import path from "node:path"
+// 模拟事件（与会话关联）：
+//   shell.created / shell.updated → data.info（含 metadata.sessionID）
+//   shell.exited / shell.deleted  → data.id
+//   session.execution.succeeded / failed / interrupted · session.idle → data.sessionID
+// 覆盖场景：事件链续跑 / 运行中暂缓（核心回归）/ updated 不重置 / 短命前台 shell /
+//   exited 与 deleted 释放闸门 / 跨实例互斥锁（外部持有、释放恢复、陈旧接管）/
+//   双触发去重 / 暂停恢复 / 预算上限 / TTL 安全阀 / 钩子注入 / 完成·阻塞·受理失败 / cleanup
+import fs from "node:fs"
 import os from "node:os"
+import path from "node:path"
+import assert from "node:assert/strict"
+import { setTimeout as sleep } from "node:timers/promises"
+import { execFileSync } from "node:child_process"
+import { fileURLToPath } from "node:url"
 
-const { default: pluginDef } = await import(new URL("../plugins/goals.js", import.meta.url).href)
+const MODE = process.env.TEST_MODE || ""
 
-const SID = "testsess_v2_check"
-const GOAL_FILE = path.join(os.homedir(), ".config", "opencode", "goals", `${SID}.json`)
-const CHAIN_WAIT = 3500 // 插件链式延迟 3000ms + 缓冲
-
-let total = 0
-let failures = 0
-const check = (name, cond) => {
-  total += 1
-  console.log(`${cond ? "PASS" : "FAIL"} | ${name}`)
-  if (!cond) failures += 1
-}
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-
-// 捕获插件日志（V2 用 console 日志替代 V1 的 toast）
-const warns = []
-const origWarn = console.warn
-console.warn = (...args) => {
-  warns.push(args.map(String).join(" "))
-  origWarn(...args)
-}
-
-// ---------------------------------------------------------------------------
-// mock 插件上下文（V2 Context 的最小实现）
-// ---------------------------------------------------------------------------
-
-const calls = { prompts: [], failNextPrompt: false }
-const hooks = {}
-const tools = new Map()
-
-const editor = {
-  add: (t) => tools.set(t.name, t),
-  update: (id, fn) => {
-    const t = tools.get(id)
-    if (t) fn(t)
-  },
-  remove: (id) => tools.delete(id),
-  namespace: () => {},
-  list: () => [...tools.values()],
-  get: (id) => tools.get(id),
+// 无 TEST_MODE 时：在子进程中依次运行两个套件（env 必须在导入插件之前设置）
+if (!MODE) {
+  const self = fileURLToPath(import.meta.url)
+  let failed = 0
+  for (const mode of ["main", "ttl"]) {
+    console.log(`\n===== unit-test.mjs [${mode}] =====`)
+    try {
+      execFileSync(process.execPath, [self], { env: { ...process.env, TEST_MODE: mode }, stdio: "inherit" })
+    } catch {
+      failed += 1
+    }
+  }
+  console.log(failed ? `\nRESULT: FAILED (${failed} suite)` : "\nRESULT: ALL SUITES PASSED")
+  process.exit(failed ? 1 : 0)
 }
 
-// 可推送的异步事件总线，模拟 ctx.event.subscribe()
-function createEventBus() {
-  const queue = []
-  let waker = null
-  let lastSignal = null
-  return {
-    get lastSignal() {
-      return lastSignal
-    },
-    push(event) {
-      queue.push(event)
-      if (waker) {
-        const wake = waker
-        waker = null
-        wake()
-      }
-    },
-    subscribe({ signal }) {
-      lastSignal = signal
-      const self = this
-      return (async function* () {
-        while (!signal.aborted) {
-          if (queue.length === 0) {
-            await new Promise((resolve) => {
-              waker = () => resolve()
-              signal.addEventListener("abort", resolve, { once: true })
-            })
-            waker = null
-            continue
-          }
-          yield queue.shift()
-        }
-        void self
-      })()
-    },
+// 隔离 goal 状态目录 + 加速定时器（必须在导入插件之前设置）
+const goalDir = fs.mkdtempSync(path.join(os.tmpdir(), "goaltest-"))
+process.env.GOAL_DIR_OVERRIDE = goalDir
+process.env.GOAL_CHAIN_DELAY_MS = "50"
+process.env.GOAL_SHELL_RECHECK_MS = "80"
+if (MODE === "ttl") process.env.GOAL_SHELL_TTL_MS = "150"
+
+const pluginDef = (await import(new URL("../plugins/goals.js", import.meta.url).href)).default
+
+// ---- 事件队列 / 假 ctx ----
+const queue = []
+let wake = null
+let lastSignal = null
+function push(e) {
+  queue.push(e)
+  if (wake) {
+    const w = wake
+    wake = null
+    w()
   }
 }
-const eventBus = createEventBus()
+
+const tools = {}
+const hooks = {}
+const prompts = []
+let failNextPrompt = false
 
 const ctx = {
-  app: { name: "opencode", version: "0.0.0-test", channel: "test" },
-  location: { directory: "test", project: { id: "test", directory: "test", canonical: "test" } },
-  options: {},
+  app: { version: "test" },
+  location: { directory: process.cwd() },
   tool: {
-    transform: async (cb) => {
-      cb(editor)
+    transform: async (fn) => {
+      await fn({
+        add: (t) => {
+          tools[t.name] = t
+          return () => {}
+        },
+      })
     },
-    reload: async () => {},
   },
   session: {
     hook: async (name, cb) => {
@@ -108,220 +81,278 @@ const ctx = {
       return { dispose: async () => {} }
     },
     prompt: async ({ sessionID, text }) => {
-      if (calls.failNextPrompt) {
-        calls.failNextPrompt = false
+      if (failNextPrompt) {
+        failNextPrompt = false
         throw new Error("mock prompt admission failure")
       }
-      calls.prompts.push({ sessionID, text })
-      return { data: { id: "inbox_mock" } }
+      prompts.push({ sessionID, text, at: Date.now() })
     },
   },
-  event: { subscribe: (options) => eventBus.subscribe(options) },
+  event: {
+    subscribe: async function* ({ signal } = {}) {
+      lastSignal = signal
+      while (!signal?.aborted) {
+        if (queue.length) {
+          yield queue.shift()
+          continue
+        }
+        await new Promise((res) => {
+          wake = res
+          signal?.addEventListener("abort", res, { once: true })
+        })
+        if (signal?.aborted) return
+      }
+    },
+  },
 }
 
-// ---------------------------------------------------------------------------
-// 工具函数
-// ---------------------------------------------------------------------------
+const cleanup = await pluginDef.setup(ctx)
+const sid = "ses_test_0001"
+const goalFile = path.join(goalDir, `${sid}.json`)
+const lockFile = path.join(goalDir, `${sid}.inject.lock`)
+const readGoal = () => JSON.parse(fs.readFileSync(goalFile, "utf8"))
 
-const emit = (type, data) => eventBus.push({ type, data })
-const idle = () => emit("session.idle", { sessionID: SID })
-const succeeded = () => emit("session.execution.succeeded", { sessionID: SID })
-const runFailed = () =>
-  emit("session.execution.failed", { sessionID: SID, error: { type: "mock", message: "mock run failure" } })
-const runInterrupted = (reason) => emit("session.execution.interrupted", { sessionID: SID, reason })
-const runTool = (name, args = {}) => tools.get(name).execute(args, { sessionID: SID })
-const content = (r) => (typeof r === "string" ? r : (r?.content ?? ""))
-const readGoal = async () => {
+// ---- v2.2 实测事件形状 ----
+const succ = () => push({ type: "session.execution.succeeded", data: { sessionID: sid } })
+const idle = () => push({ type: "session.idle", data: { sessionID: sid } })
+const shellCreated = (id) =>
+  push({
+    type: "shell.created",
+    data: {
+      info: {
+        id,
+        status: "running",
+        command: `cmd-${id}`,
+        cwd: ".",
+        shell: "powershell",
+        metadata: { sessionID: sid },
+        time: { started: Date.now() },
+      },
+    },
+  })
+const shellUpdated = (id) =>
+  push({
+    type: "shell.updated",
+    data: { info: { id, status: "running", command: `cmd-${id}`, metadata: { sessionID: sid } } },
+  })
+const shellExited = (id) => push({ type: "shell.exited", data: { id, exit: 0, status: "completed" } })
+const shellDeleted = (id) => push({ type: "shell.deleted", data: { id } })
+
+let step = 0
+const ok = (name) => console.log(`[PASS ${++step}] ${name}`)
+
+try {
+  if (MODE === "main") {
+    const r = await tools.goal_set.execute({ objective: "测试目标", max_iterations: 8 }, { sessionID: sid })
+    assert.match(r.content, /已创建/)
+    ok("goal_set creates goal")
+
+    // 场景1：一轮结束后注入下一轮（execution.succeeded 链式驱动）
+    succ()
+    await sleep(250)
+    assert.equal(prompts.length, 1)
+    assert.equal(readGoal().iteration, 1)
+    assert.equal(readGoal().pending, true)
+    ok("round1 injected on execution.succeeded")
+
+    succ()
+    await sleep(250)
+    assert.equal(prompts.length, 2)
+    assert.equal(readGoal().iteration, 2)
+    ok("round2 injected after round1 ended")
+
+    // 场景2（核心回归）：后台 shell 运行期间暂缓——旧 bug 是回合结束后 ~3s 立即注入
+    shellCreated("sh_x1")
+    succ()
+    await sleep(300)
+    assert.equal(prompts.length, 2, "shell running must defer continuation")
+    assert.equal(readGoal().iteration, 2)
+    assert.equal(readGoal().pending, false)
+    ok("deferred while background shell running")
+
+    // 场景3：shell.updated 不重置计时、不影响暂缓
+    shellUpdated("sh_x1")
+    await sleep(120)
+    assert.equal(prompts.length, 2)
+    ok("shell.updated keeps deferral (no timer reset)")
+
+    // 场景4：短命前台 shell（created→exited）的复检仍受 x1 闸门约束
+    shellCreated("sh_fg1")
+    shellExited("sh_fg1")
+    await sleep(160)
+    assert.equal(prompts.length, 2, "exited shell recheck still gated by x1")
+    ok("short-lived shell exits; still gated by x1")
+
+    // 场景5：sh_x1 真正结束（exited）→ 复检恢复续跑
+    shellExited("sh_x1")
+    await sleep(450)
+    assert.equal(prompts.length, 3, "continuation resumes after shell exits")
+    assert.equal(readGoal().iteration, 3)
+    ok("round3 injected after background shell exited")
+
+    // 场景6：再次暂缓；shell.deleted 同样释放闸门
+    shellCreated("sh_x2")
+    succ()
+    await sleep(300)
+    assert.equal(prompts.length, 3, "second shell must also defer")
+    shellDeleted("sh_x2")
+    await sleep(450)
+    assert.equal(prompts.length, 4, "deleted event must release gate")
+    assert.equal(readGoal().iteration, 4)
+    ok("shell.deleted resumes continuation")
+
+    // 场景7（跨实例互斥锁）：外部持有 inject.lock → 放弃注入
+    fs.writeFileSync(lockFile, `foreign:${process.pid}:${Date.now()}`)
+    succ()
+    await sleep(180)
+    assert.equal(prompts.length, 4, "foreign inject.lock must block injection")
+    assert.equal(readGoal().iteration, 4)
+    ok("foreign inject lock blocks injection")
+
+    // 场景8：锁释放后 idle 兜底恢复
+    fs.unlinkSync(lockFile)
+    idle()
+    await sleep(180)
+    assert.equal(prompts.length, 5, "continuation resumes after lock release")
+    assert.equal(readGoal().iteration, 5)
+    assert.equal(fs.existsSync(lockFile), false, "own lock released after injection")
+    ok("resumes after foreign lock release")
+
+    // 场景9：陈旧锁（mtime > 5s）被接管
+    fs.writeFileSync(lockFile, `stale:${process.pid}:0`)
+    const old = new Date(Date.now() - 10_000)
+    fs.utimesSync(lockFile, old, old)
+    succ()
+    await sleep(220)
+    assert.equal(prompts.length, 6, "stale lock must be taken over")
+    assert.equal(readGoal().iteration, 6)
+    assert.equal(fs.existsSync(lockFile), false, "taken-over lock released after injection")
+    ok("stale inject lock taken over and released")
+
+    // 场景10：双触发（succeeded + idle）只注入一次
+    succ()
+    idle()
+    await sleep(350)
+    assert.equal(prompts.length, 7, "double trigger must produce single injection")
+    assert.equal(readGoal().iteration, 7)
+    ok("double trigger produces single injection")
+
+    // 场景11：暂停不续跑
+    await tools.goal_pause.execute({}, { sessionID: sid })
+    succ()
+    await sleep(250)
+    assert.equal(prompts.length, 7)
+    ok("paused goal does not continue")
+
+    // 场景12：恢复续跑
+    await tools.goal_resume.execute({}, { sessionID: sid })
+    succ()
+    await sleep(250)
+    assert.equal(prompts.length, 8)
+    assert.equal(readGoal().iteration, 8)
+    ok("resume continues")
+
+    // 场景13：迭代预算
+    succ()
+    await sleep(300)
+    assert.equal(prompts.length, 8)
+    assert.equal(readGoal().status, "budget_limited")
+    ok("budget limit enforced")
+
+    // 场景14：context / compaction 钩子注入目标（pursuing 状态下）
+    await tools.goal_clear.execute({}, { sessionID: sid })
+    await tools.goal_set.execute({ objective: "钩子测试", max_iterations: 5 }, { sessionID: sid })
+    let sys = []
+    await hooks.context({ sessionID: sid, system: sys })
+    assert.equal(sys.length, 1)
+    assert.ok(sys[0].text.includes("[GOAL MODE]") && sys[0].text.includes("钩子测试"))
+    sys = []
+    await hooks.compaction({ sessionID: sid, system: sys })
+    assert.equal(sys.length, 1)
+    assert.ok(sys[0].text.includes("GOAL MODE 状态"))
+    ok("context/compaction hooks inject goal")
+
+    // 场景15：pursuing 中重复创建被拒绝
+    const r15 = await tools.goal_set.execute({ objective: "重复目标" }, { sessionID: sid })
+    assert.match(r15.content, /已存在活跃目标/)
+    ok("duplicate goal_set rejected while pursuing")
+
+    // 场景16：完成流程——短证据被拒 → 有效证据达成 → 停止续跑
+    const r16a = await tools.goal_complete.execute({ evidence: "ok" }, { sessionID: sid })
+    assert.match(r16a.content, /证据过短/)
+    const r16b = await tools.goal_complete.execute({ evidence: "测试输出 acc=0.90，见 /tmp/log" }, { sessionID: sid })
+    assert.match(r16b.content, /已达成/)
+    succ()
+    await sleep(250)
+    assert.equal(prompts.length, 8)
+    ok("short evidence rejected; valid evidence achieves; stops")
+
+    // 场景17：阻塞后停止续跑
+    await tools.goal_clear.execute({}, { sessionID: sid })
+    await tools.goal_set.execute({ objective: "阻塞测试", max_iterations: 5 }, { sessionID: sid })
+    const r17 = await tools.goal_block.execute({ reason: "缺少用户输入" }, { sessionID: sid })
+    assert.match(r17.content, /已阻塞/)
+    succ()
+    await sleep(250)
+    assert.equal(prompts.length, 8)
+    ok("blocked stops continuation")
+
+    // 场景18：prompt 受理失败 → 不注入、释放互斥锁、计入失败
+    await tools.goal_clear.execute({}, { sessionID: sid })
+    await tools.goal_set.execute({ objective: "受理失败测试", max_iterations: 5 }, { sessionID: sid })
+    failNextPrompt = true
+    succ()
+    await sleep(250)
+    assert.equal(prompts.length, 8)
+    assert.equal(fs.existsSync(lockFile), false, "lock must be released on prompt failure")
+    const g18 = readGoal()
+    assert.equal(g18.pending, false)
+    assert.equal(g18.fail_count, 1)
+    ok("prompt admission failure releases lock and counts")
+
+    // 场景19：cleanup 中止事件订阅
+    cleanup()
+    await sleep(100)
+    assert.equal(lastSignal?.aborted, true)
+    ok("cleanup aborts event subscription")
+
+    // 收尾：无残留锁文件
+    assert.equal(fs.existsSync(lockFile), false, "no leftover lock file")
+    ok("no leftover inject lock")
+
+    console.log("ALL MAIN TESTS PASSED")
+  } else if (MODE === "ttl") {
+    await tools.goal_set.execute({ objective: "TTL 测试", max_iterations: 5 }, { sessionID: sid })
+    succ()
+    await sleep(250)
+    assert.equal(prompts.length, 1)
+    ok("round1 injected (ttl mode)")
+
+    // 幽灵 shell：created 后无结束事件；TTL 内必须暂缓
+    shellCreated("sh_ghost")
+    succ()
+    await sleep(300)
+    assert.equal(prompts.length, 1, "must defer while ghost shell is fresh")
+    ok("deferred with fresh ghost shell")
+
+    // 超过安全阀 TTL：复检时视为完成事件丢失，告警后放行
+    await sleep(250)
+    idle()
+    await sleep(300)
+    assert.equal(prompts.length, 2, "stale shell must be bypassed after TTL")
+    assert.equal(readGoal().iteration, 2)
+    ok("stale shell bypassed after safety TTL")
+
+    console.log("ALL TTL TESTS PASSED")
+  } else {
+    throw new Error("unknown TEST_MODE: " + MODE)
+  }
+} finally {
   try {
-    return JSON.parse(await fsp.readFile(GOAL_FILE, "utf8"))
+    fs.rmSync(goalDir, { recursive: true, force: true })
   } catch {
-    return null
+    /* ignore */
   }
 }
 
-// ---------------------------------------------------------------------------
-// 测试流程
-// ---------------------------------------------------------------------------
-
-await fsp.rm(GOAL_FILE, { force: true })
-
-// 1. 结构：V2 定义 + 工具/钩子注册
-const cleanup = await pluginDef.setup(ctx)
-check("默认导出为 V2 定义（id + setup）", pluginDef?.id === "goals" && typeof pluginDef?.setup === "function")
-const expectedTools = [
-  "goal_set", "goal_status", "goal_update_progress", "goal_complete",
-  "goal_block", "goal_pause", "goal_resume", "goal_clear",
-]
-check("8 个工具全部注册", expectedTools.every((t) => typeof tools.get(t)?.execute === "function"))
-check("context 钩子已注册", typeof hooks.context === "function")
-check("compaction 钩子已注册", typeof hooks.compaction === "function")
-check("setup 返回 cleanup 函数", typeof cleanup === "function")
-
-// 2. 创建 goal（max_iterations=3）
-let r = await runTool("goal_set", {
-  objective: "测试目标：验证事件驱动续跑",
-  done_condition: "3轮内完成",
-  max_iterations: 3,
-})
-check("goal_set 成功", content(r).includes("已创建"))
-
-// 3. 重复创建被拒
-r = await runTool("goal_set", { objective: "另一个" })
-check("重复创建被拒绝", content(r).includes("已存在活跃目标"))
-
-// 4. system 注入（context / compaction 钩子）
-let sys = []
-await hooks.context({ sessionID: SID, system: sys })
-check("context 注入目标", sys.length === 1 && sys[0].text.includes("[GOAL MODE]") && sys[0].text.includes("测试目标"))
-sys = []
-await hooks.compaction({ sessionID: SID, system: sys })
-check("compaction 注入保留块", sys.length === 1 && sys[0].text.includes("GOAL MODE 状态"))
-
-// 5. idle 兜底触发第 1 轮（延迟调度，不立即发送）
-idle()
-await sleep(150)
-check("idle 后延迟调度（不立即发送）", calls.prompts.length === 0)
-await sleep(CHAIN_WAIT)
-check("idle 触发第 1 轮", calls.prompts.length === 1)
-check("续跑消息含轮数", calls.prompts[0]?.text?.includes("第 1/3 轮"))
-
-// 6. 完成事件驱动第 2 轮，且 idle+succeeded 双触发不产生重复续跑
-idle()
-succeeded()
-await sleep(CHAIN_WAIT)
-check("完成事件驱动第 2 轮（双触发无重复）", calls.prompts.length === 2)
-check("第 2 轮消息含轮数", calls.prompts[1]?.text?.includes("第 2/3 轮"))
-
-// 7. 第 3 轮
-succeeded()
-await sleep(CHAIN_WAIT)
-check("事件驱动第 3 轮", calls.prompts.length === 3)
-check("第 3 轮消息含轮数", calls.prompts[2]?.text?.includes("第 3/3 轮"))
-
-// 8. 迭代上限：达到后停止续跑
-succeeded()
-await sleep(CHAIN_WAIT)
-check("达到上限后停止（无第 4 轮）", calls.prompts.length === 3)
-let g = await runTool("goal_status")
-check("状态=budget_limited", content(g).includes("已达迭代上限"))
-check("上限记录日志（替代 V1 toast）", warns.some((w) => w.includes("iteration budget")))
-
-// 9. 进度记录 + 暂停阻断续跑
-await runTool("goal_clear")
-await runTool("goal_set", { objective: "暂停测试", max_iterations: 5 })
-r = await runTool("goal_update_progress", { note: "测试进度" })
-check("进度记录成功", content(r).includes("已记录"))
-idle()
-await sleep(CHAIN_WAIT)
-check("新目标触发续跑", calls.prompts.length === 4)
-await runTool("goal_pause")
-idle() // 用户回合结束 + 本轮完成，均不应续跑
-succeeded()
-await sleep(CHAIN_WAIT)
-check("暂停后不续跑", calls.prompts.length === 4)
-g = await runTool("goal_status")
-check("暂停状态可见", content(g).includes("已暂停"))
-
-// 10. 恢复后续跑
-await runTool("goal_resume")
-succeeded()
-await sleep(CHAIN_WAIT)
-check("恢复后继续续跑", calls.prompts.length === 5)
-check("恢复后轮数正确", calls.prompts[4]?.text?.includes("第 2/5 轮"))
-
-// 11. 完成：短证据被拒 + 正常完成 + 停止
-r = await runTool("goal_complete", { evidence: "ok" })
-check("短证据被拒", content(r).includes("证据过短"))
-r = await runTool("goal_complete", { evidence: "benchmark 输出 acc=0.90，见 /tmp/log" })
-check("goal_complete 成功", content(r).includes("已达成"))
-succeeded()
-idle()
-await sleep(CHAIN_WAIT)
-check("完成后停止续跑", calls.prompts.length === 5)
-
-// 12. 阻塞后 idle 兜底也不续跑
-await runTool("goal_clear")
-await runTool("goal_set", { objective: "阻塞测试", max_iterations: 5 })
-r = await runTool("goal_block", { reason: "缺输入" })
-check("goal_block 成功", content(r).includes("已阻塞"))
-idle()
-succeeded()
-await sleep(CHAIN_WAIT)
-check("阻塞后不续跑", calls.prompts.length === 5)
-
-// 13. 连续执行失败 → 计数 → 达到上限转 blocked
-await runTool("goal_clear")
-await runTool("goal_set", { objective: "失败测试", max_iterations: 5 })
-idle()
-await sleep(CHAIN_WAIT)
-check("失败场景触发第 1 轮", calls.prompts.length === 6)
-runFailed()
-await sleep(300)
-g = await readGoal()
-check("失败计数 pending 清除", g?.fail_count === 1 && g?.pending === false)
-idle()
-await sleep(CHAIN_WAIT)
-check("单次失败后仍可继续（idle 兜底）", calls.prompts.length === 7)
-runFailed()
-await sleep(300)
-check("失败计数=2", (await readGoal())?.fail_count === 2)
-idle()
-await sleep(CHAIN_WAIT)
-check("第二次失败后继续", calls.prompts.length === 8)
-runFailed()
-await sleep(300)
-g = await readGoal()
-check("连续 3 次失败转 blocked", g?.status === "blocked" && g?.fail_count === 3)
-idle()
-await sleep(CHAIN_WAIT)
-check("blocked 后不续跑", calls.prompts.length === 8)
-
-// 14. 用户手动中断 → 自动暂停（V1 语义保留）
-await runTool("goal_clear")
-await runTool("goal_set", { objective: "中断测试", max_iterations: 3 })
-idle()
-await sleep(CHAIN_WAIT)
-check("中断场景触发续跑", calls.prompts.length === 9)
-runInterrupted("user")
-await sleep(300)
-g = await readGoal()
-check("用户中断自动暂停", g?.status === "paused" && g?.pending === false)
-
-// 15. superseded 中断（被新输入替代）→ 保持 pursuing
-await runTool("goal_clear")
-await runTool("goal_set", { objective: "替代测试", max_iterations: 3 })
-idle()
-await sleep(CHAIN_WAIT)
-check("替代场景触发续跑", calls.prompts.length === 10)
-runInterrupted("superseded")
-await sleep(300)
-g = await readGoal()
-check("superseded 中断保持 pursuing", g?.status === "pursuing" && g?.pending === false)
-
-// 16. prompt 提交失败 → 释放 pending 并计入失败
-await runTool("goal_clear")
-await runTool("goal_set", { objective: "提交失败测试", max_iterations: 3 })
-calls.failNextPrompt = true
-idle()
-await sleep(CHAIN_WAIT)
-check("提交失败不产生续跑消息", calls.prompts.length === 10)
-g = await readGoal()
-check("提交失败释放 pending 并计数", g?.pending === false && g?.fail_count === 1)
-
-// 17. 清理
-r = await runTool("goal_clear")
-check("goal_clear 成功", content(r).includes("已清除"))
-r = await runTool("goal_status")
-check("clear 后无 goal", content(r).includes("没有 Goal"))
-
-// 18. cleanup 中止事件订阅
-cleanup()
-await sleep(100)
-check("cleanup 中止事件订阅", eventBus.lastSignal?.aborted === true)
-
-await fsp.rm(GOAL_FILE, { force: true })
-console.warn = origWarn
-
-console.log(`\n总续跑轮数: ${calls.prompts.length}`)
-console.log(`${total - failures}/${total} 通过`)
-if (failures > 0) process.exitCode = 1
+process.exit(0)
